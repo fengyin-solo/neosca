@@ -4,11 +4,14 @@ import logging
 import os
 import os.path as os_path
 import sys
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from neosca.ns_io import Ns_Cache, Ns_IO
 from neosca.ns_lca.ns_lca_counter import Ns_LCA_Counter
 from neosca.ns_utils import Ns_Procedure_Result
+
+if TYPE_CHECKING:
+    from neosca.ns_manifest import Ns_Manifest
 
 
 class Ns_LCA:
@@ -28,6 +31,7 @@ class Ns_LCA:
         is_stdout: bool = False,
         is_save_matches: bool = False,
         is_save_values: bool = True,
+        manifest: "Ns_Manifest | None" = None,
     ) -> None:
         assert wordlist in ("bnc", "anc")
         assert tagset in ("ud", "ptb")
@@ -49,6 +53,7 @@ class Ns_LCA:
         self.is_use_cache = is_use_cache
         self.is_save_matches = is_save_matches
         self.is_save_values = is_save_values
+        self.manifest = manifest
 
         self.counters: list[Ns_LCA_Counter] = []
 
@@ -64,6 +69,9 @@ class Ns_LCA:
         # Use cache
         if self.is_use_cache and is_cache_available:
             logging.info(f"Loading cache: {cache_path}.")
+            if self.manifest is not None:
+                self.manifest.record_file(file_path)
+                self.manifest.record_cache(file_path, cache_path, True)
             doc = Ns_NLP_Stanza.serialized2doc(Ns_IO.load_lzma(cache_path))
             return Ns_NLP_Stanza.get_lemma_and_pos(doc, tagset=self.tagset, cache_path=cache_path)
 
@@ -72,6 +80,10 @@ class Ns_LCA:
 
         if not self.is_cache:
             cache_path: str | None = None  # type: ignore
+
+        if self.manifest is not None:
+            self.manifest.record_file(file_path)
+            self.manifest.record_cache(file_path, cache_path, False)
 
         try:
             return self.get_lempos_frm_text(text)
@@ -94,6 +106,9 @@ class Ns_LCA:
     def run_on_text(self, text: str, *, file_path: str = "cli_text", clear: bool = True) -> None:
         if clear:
             self.counters.clear()
+
+        if self.manifest is not None:
+            self.manifest.record_text(text)
 
         lempos_tuples = self.get_lempos_frm_text(text)
         counter = self.init_new_counter(file_path)

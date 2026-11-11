@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import glob
+import hashlib
 import json
 import logging
 import lzma
@@ -8,6 +9,7 @@ import os
 import os.path as os_path
 import pickle
 import sys
+import tempfile
 import zipfile
 from collections.abc import Generator, Iterable, Sequence
 from os import PathLike
@@ -210,6 +212,45 @@ class Ns_IO(metaclass=Ns_IO_Meta):
             Path(path).parent.mkdir(parents=True)
             with open(path, "wb") as f:
                 f.write(data)
+
+    @staticmethod
+    def sha256_bytes(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    @classmethod
+    def sha256_file(cls, file_path: str | PathLike, chunk_size: int = 65536) -> str:
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def dump_json_atomic(cls, data: Any, path: str | PathLike) -> None:
+        """
+        Atomically write JSON to *path*. Serialization happens before any disk
+        write, and the payload is flushed to a temporary file in the same
+        directory before os.replace(), so a failed write never leaves a partial
+        file at *path*.
+        """
+        abs_path = os_path.abspath(os.fspath(path))
+        # Serialize first: a serialization error must not touch the disk.
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+
+        parent = os_path.dirname(abs_path)
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=f".{os_path.basename(abs_path)}.", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, abs_path)
+        except BaseException:
+            # Never leave a half-written file or a stale temporary file behind.
+            if os_path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
     @classmethod
     def get_verified_ifile_list(cls, ifile_list: Iterable[str]) -> list[str]:

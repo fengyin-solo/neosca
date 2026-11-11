@@ -4,10 +4,14 @@ import logging
 import os
 import os.path as os_path
 import sys
+from typing import TYPE_CHECKING
 
 from neosca.ns_io import Ns_Cache, Ns_IO
 from neosca.ns_sca.ns_sca_counter import Ns_SCA_Counter
 from neosca.ns_utils import Ns_Procedure_Result
+
+if TYPE_CHECKING:
+    from neosca.ns_manifest import Ns_Manifest
 
 
 class Ns_SCA:
@@ -25,6 +29,7 @@ class Ns_SCA:
         is_save_matches: bool = False,
         is_save_values: bool = True,
         config: str | None = None,
+        manifest: "Ns_Manifest | None" = None,
     ) -> None:
         self.ofile_freq = ofile_freq
         self.oformat_freq = oformat_freq
@@ -37,6 +42,7 @@ class Ns_SCA:
         self.is_skip_parsing = is_skip_parsing
         self.is_save_matches = is_save_matches
         self.is_save_values = is_save_values
+        self.manifest = manifest
 
         self.user_data, self.user_structure_defs, self.user_snames = self.load_user_config(config)
         logging.debug(f"User defined snames: {self.user_snames}")
@@ -71,17 +77,24 @@ class Ns_SCA:
 
     # }}}
     def get_forest_frm_file(self, file_path: str) -> str:  # {{{
-        from neosca.ns_nlp import Ns_NLP_Stanza
         from stanza import Document
+
+        from neosca.ns_nlp import Ns_NLP_Stanza
 
         if self.is_skip_parsing:
             # Assume input as parse trees, e.g., (ROOT (S (NP) (VP)))
+            if self.manifest is not None:
+                self.manifest.record_file(file_path)
+                self.manifest.record_cache(file_path, None, False)
             return Ns_IO.load_file(file_path)
 
         cache_path, is_cache_available = Ns_Cache.get_cache_path(file_path)
         # Use cache
         if self.is_use_cache and is_cache_available:
             logging.info(f"Loading cache: {cache_path}.")
+            if self.manifest is not None:
+                self.manifest.record_file(file_path)
+                self.manifest.record_cache(file_path, cache_path, True)
             doc: Document = Ns_NLP_Stanza.serialized2doc(Ns_IO.load_lzma(cache_path))
             return Ns_NLP_Stanza.get_constituency_forest(doc, cache_path=cache_path)
 
@@ -90,6 +103,10 @@ class Ns_SCA:
 
         if not self.is_cache:
             cache_path = None  # type: ignore
+
+        if self.manifest is not None:
+            self.manifest.record_file(file_path)
+            self.manifest.record_cache(file_path, cache_path, False)
 
         try:
             forest = self.get_forest_frm_text(text, cache_path)
@@ -105,6 +122,9 @@ class Ns_SCA:
     def run_on_text(self, text: str, *, file_path: str = "cli_text", clear: bool = True) -> None:  # {{{
         if clear:
             self.counters.clear()
+
+        if self.manifest is not None:
+            self.manifest.record_text(text)
 
         forest: str = self.get_forest_frm_text(text)
         counter = Ns_SCA_Counter(

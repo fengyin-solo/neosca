@@ -4,11 +4,13 @@ import os
 import os.path as os_path
 import sys
 from collections.abc import Callable
+from typing import Any
 
 from neosca.ns_about import __title__, __version__
 from neosca.ns_consts import CACHE_DIR
 from neosca.ns_io import Ns_Cache, Ns_IO
 from neosca.ns_lca.ns_lca import Ns_LCA
+from neosca.ns_manifest import Ns_Manifest
 from neosca.ns_print import color_print
 from neosca.ns_sca.ns_sca import Ns_SCA
 from neosca.ns_utils import Ns_Procedure_Result
@@ -19,6 +21,7 @@ class Ns_Main_Cli:
         self.cwd = os.getcwd()
         self.args_parser: argparse.ArgumentParser = self.create_args_parser()
         self.options: argparse.Namespace = argparse.Namespace()
+        self.manifest: Ns_Manifest | None = None
 
     def __add_log_levels(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -110,6 +113,16 @@ class Ns_Main_Cli:
             action="store_true",
             default=False,
             help="Write the frequency output to the stdout instead of saving it to a file.",
+        )
+        sca_parser.add_argument(
+            "--manifest",
+            metavar="<filename>",
+            dest="manifest_path",
+            default=None,
+            help=(
+                "Write a JSON run manifest recording tool version, effective options, input"
+                " digests, cache usage and output digest. Cannot be used together with --stdout."
+            ),
         )
         sca_parser.add_argument(
             "--select",
@@ -230,6 +243,16 @@ class Ns_Main_Cli:
             action="store_true",
             default=False,
             help="Write the output to the stdout instead of saving it to a file.",
+        )
+        lca_parser.add_argument(
+            "--manifest",
+            metavar="<filename>",
+            dest="manifest_path",
+            default=None,
+            help=(
+                "Write a JSON run manifest recording tool version, effective options, input"
+                " digests, cache usage and output digest. Cannot be used together with --stdout."
+            ),
         )
         lca_parser.add_argument(
             "--text",
@@ -398,8 +421,52 @@ class Ns_Main_Cli:
         if (func := getattr(options, "func", None)) is not None:
             func(options)
 
+        if getattr(options, "manifest_path", None) and getattr(options, "is_stdout", False):
+            return (
+                False,
+                (
+                    '"--manifest" cannot be used together with "--stdout": the output digest of an'
+                    " on-disk result file cannot be confirmed when the result is written to stdout."
+                ),
+            )
+
         self.options = options
         return True, None
+
+    def _build_manifest_options(self) -> dict[str, Any]:
+        """Normalize the effective options into JSON-basic, stably ordered values."""
+        options = self.options
+        manifest_options: dict[str, Any] = {
+            "cache": bool(options.is_cache),
+            "combine_files": [
+                sorted(os_path.abspath(path) for path in subfiles) for subfiles in self.verified_subfiles_list
+            ],
+            "manifest": os_path.abspath(options.manifest_path),
+            "output_file": os_path.abspath(options.ofile_freq),
+            "output_format": options.oformat_freq,
+            "save_matches": bool(options.is_save_matches),
+            "stdout": bool(options.is_stdout),
+            "text": options.text is not None,
+            "use_cache": bool(options.is_use_cache),
+        }
+        if options.command == "sca":
+            manifest_options.update(
+                {
+                    "ftype": sorted(options.ifile_types),
+                    "no_parse": bool(options.is_skip_parsing),
+                    "select": (
+                        list(options.selected_measures) if options.selected_measures is not None else None
+                    ),
+                }
+            )
+        else:
+            manifest_options.update(
+                {
+                    "tagset": options.tagset,
+                    "wordlist": options.wordlist,
+                }
+            )
+        return manifest_options
 
     def check_python(self) -> Ns_Procedure_Result:
         v_info = sys.version_info
@@ -450,7 +517,18 @@ class Ns_Main_Cli:
                 sucess, err_msg = Ns_IO.is_writable(self.options.ofile_freq)
                 if not sucess:
                     return sucess, err_msg
-            func(self, *args, **kwargs)
+            if getattr(self.options, "manifest_path", None):
+                try:
+                    func(self, *args, **kwargs)
+                except BaseException as exc:
+                    # Never fake a success manifest on failure; the manifest is
+                    # itself written atomically, so no half JSON can remain.
+                    if self.manifest is not None:
+                        self.manifest.mark_failure(exc)
+                        self.manifest.write()
+                    return False, f"{type(exc).__name__}: {exc}"
+            else:
+                func(self, *args, **kwargs)
             self.exit_routine()
             return True, None
 
@@ -458,7 +536,16 @@ class Ns_Main_Cli:
 
     @run_tmpl
     def run_on_input(self) -> Ns_Procedure_Result:
-        analyzer = self.options.analyzer_class(**self.init_kwargs)
+        self.manifest: Ns_Manifest | None = None
+        if getattr(self.options, "manifest_path", None) is not None:
+            self.manifest = Ns_Manifest(
+                analyzer=self.options.command,
+                manifest_path=self.options.manifest_path,
+                options=self._build_manifest_options(),
+            )
+            self.manifest.start()
+
+        analyzer = self.options.analyzer_class(**self.init_kwargs, manifest=self.manifest)
 
         if self.options.text is not None:
             analyzer.run_on_text(self.options.text)
@@ -470,6 +557,10 @@ class Ns_Main_Cli:
 
         if file_paths:
             analyzer.run_on_file_or_subfiles_list(file_paths)
+
+        if self.manifest is not None:
+            self.manifest.mark_success(self.options.ofile_freq)
+            self.manifest.write()
 
         return True, None
 
