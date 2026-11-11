@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import glob
 import json
 import logging
@@ -7,11 +8,14 @@ import lzma
 import os
 import os.path as os_path
 import pickle
+import stat
 import sys
+import tempfile
 import zipfile
 from collections.abc import Generator, Iterable, Sequence
+from datetime import datetime, timezone
 from os import PathLike
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 from xml.etree.ElementTree import XML, fromstring
 
@@ -284,6 +288,14 @@ class Ns_IO(metaclass=Ns_IO_Meta):
 
 class Ns_Cache:
     CACHE_EXTENSION = ".pickle.lzma"
+
+    STATUS_VALID = "valid"
+    STATUS_MISSING = "missing"
+    STATUS_OUTDATED = "outdated"
+    STATUS_ORPHANED = "orphaned"
+    ALL_STATUSES: tuple[str, ...] = (STATUS_VALID, STATUS_MISSING, STATUS_OUTDATED, STATUS_ORPHANED)
+    PRUNABLE_STATUSES: tuple[str, ...] = (STATUS_MISSING, STATUS_OUTDATED, STATUS_ORPHANED)
+
     # fpath_cname: { "/absolute/path/to/foo.txt": "foo.pickle.lzma", ... }
     fpath_cname: dict[str, str] = (
         Ns_IO.load_json(CACHE_INFO_PATH)
@@ -336,6 +348,243 @@ class Ns_Cache:
                 continue
             cache_size = cls._size_fmt(os_path.getsize(cache_path))
             yield cache_name, cache_path, cache_size, file_path
+
+    # ------------------------------------------------------------------
+    # Cache inspection and pruning
+    # ------------------------------------------------------------------
+    @classmethod
+    def inspect_entry(cls, input_path: str, cache_name: str) -> dict[str, Any]:
+        """Inspect one metadata entry and determine its cache status.
+
+        Statuses:
+            valid:    cache file exists, is a non-empty regular file newer
+                      than the input file, and the input file still exists
+            missing:  metadata references a cache file that does not exist
+            outdated: both files exist but the cache is empty or not newer
+                      than the input file
+            orphaned: the input file no longer exists
+        """
+        cache_path = cls._name2path(cache_name)
+        input_exists = os_path.exists(input_path)
+
+        # lstat/lexists do not follow symbolic links, so a dangling or
+        # malicious link is still reported as present but never trusted.
+        cache_stat: os.stat_result | None = None
+        if os_path.lexists(cache_path):
+            try:
+                cache_stat = os.lstat(cache_path)
+            except OSError:
+                cache_stat = None
+        cache_exists = cache_stat is not None
+        is_symlink = cache_stat is not None and stat.S_ISLNK(cache_stat.st_mode)
+        is_regular_file = cache_stat is not None and stat.S_ISREG(cache_stat.st_mode)
+
+        cache_size: int | None = cache_stat.st_size if cache_stat is not None else None
+        cache_mtime_epoch: float | None = cache_stat.st_mtime if cache_stat is not None else None
+        cache_mtime: str | None = (
+            datetime.fromtimestamp(cache_stat.st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+            if cache_stat is not None
+            else None
+        )
+
+        is_orphaned = not input_exists
+        is_outdated = False
+        if cache_exists and input_exists:
+            # Mirror the validity rules in get_cache_path(): an empty cache
+            # or a cache not newer than the input is outdated.
+            is_outdated = cache_stat.st_size == 0 or cache_stat.st_mtime <= os_path.getmtime(input_path)  # type: ignore[union-attr]
+
+        if not cache_exists:
+            status = cls.STATUS_MISSING
+        elif is_orphaned:
+            status = cls.STATUS_ORPHANED
+        elif is_outdated:
+            status = cls.STATUS_OUTDATED
+        else:
+            status = cls.STATUS_VALID
+
+        return {
+            "input_path": input_path,
+            "cache_name": cache_name,
+            "cache_path": cache_path,
+            "cache_exists": cache_exists,
+            "input_exists": input_exists,
+            "cache_size": cache_size,
+            "cache_mtime": cache_mtime,
+            "cache_mtime_epoch": cache_mtime_epoch,
+            "is_outdated": is_outdated,
+            "is_orphaned": is_orphaned,
+            "is_symlink": is_symlink,
+            "is_regular_file": is_regular_file,
+            "status": status,
+        }
+
+    @classmethod
+    def list_entries(cls) -> list[dict[str, Any]]:
+        """Return all metadata entries, sorted by input path."""
+        entries = [
+            cls.inspect_entry(input_path, cache_name) for input_path, cache_name in cls.fpath_cname.items()
+        ]
+        return sorted(entries, key=lambda entry: entry["input_path"])
+
+    @classmethod
+    def get_cache_dir(cls) -> str:
+        return str(CACHE_DIR)
+
+    @classmethod
+    def get_cache_info_path(cls) -> str:
+        return str(CACHE_INFO_PATH)
+
+    @classmethod
+    def _is_within_cache_root(cls, cache_path: str) -> Ns_Procedure_Result:
+        """Ensure cache_path stays inside CACHE_DIR without following links.
+
+        Guards against absolute names, parent-directory (``..``) escapes and
+        nested paths stored in a tampered cache_info file. Containment is
+        checked on the parent directory only, so a symbolic link is never
+        resolved while validating its location.
+        """
+        raw = PurePath(cache_path)
+        cache_name = cls._path2name(cache_path)
+        if os_path.isabs(cache_name) or ".." in raw.parts or cache_name != raw.name:
+            return False, f"unsafe cache name outside the cache root: {cache_name}"
+
+        root = Path(CACHE_DIR).resolve()
+        try:
+            resolved_parent = Path(cache_path).parent.resolve()
+            resolved_parent.relative_to(root)
+        except (OSError, ValueError):
+            return False, f"cache path escapes the cache root ({root}): {cache_path}"
+        return True, None
+
+    @classmethod
+    def _check_deletable(cls, cache_path: str) -> Ns_Procedure_Result:
+        """Validate that cache_path is safe to delete.
+
+        Only regular files located inside the cache root are deletable.
+        Symbolic links are never followed and never removed.
+        """
+        success, err_msg = cls._is_within_cache_root(cache_path)
+        if not success:
+            return False, err_msg
+
+        if not os_path.lexists(cache_path):
+            # Nothing on disk to remove (e.g. an already-missing cache file).
+            return True, None
+
+        cache_stat = os.lstat(cache_path)
+        if stat.S_ISLNK(cache_stat.st_mode):
+            return False, f"refuse to delete a symbolic link: {cache_path}"
+        if not stat.S_ISREG(cache_stat.st_mode):
+            return False, f"refuse to delete a non-regular file: {cache_path}"
+        return True, None
+
+    @classmethod
+    def prune_entries(cls, statuses: Sequence[str], *, apply: bool) -> dict[str, Any]:
+        """Prune cache entries belonging to the given statuses.
+
+        Without ``apply`` this is a dry run: no file or metadata is changed.
+        With ``apply``, validated cache files are deleted and cache_info is
+        rewritten atomically once. Entries whose deletion fails keep their
+        metadata and are reported under ``failed``.
+        """
+        normalized_statuses = tuple(dict.fromkeys(statuses))
+        selected = [entry for entry in cls.list_entries() if entry["status"] in normalized_statuses]
+
+        report_entries: list[dict[str, Any]] = []
+        for entry in selected:
+            cache_path = entry["cache_path"]
+            success, err_msg = cls._check_deletable(cache_path)
+            if not success:
+                report_entries.append({**entry, "action": "failed", "reason": err_msg})
+                continue
+
+            if not apply:
+                report_entries.append({**entry, "action": "would_delete", "reason": None})
+                continue
+
+            if entry["cache_exists"]:
+                try:
+                    os.remove(cache_path)
+                except OSError as exc:
+                    report_entries.append(
+                        {**entry, "action": "failed", "reason": f"{type(exc).__name__}: {exc}"}
+                    )
+                    continue
+            report_entries.append({**entry, "action": "deleted", "reason": None})
+
+        metadata_updated = False
+        if apply:
+            removed_inputs = {entry["input_path"] for entry in report_entries if entry["action"] == "deleted"}
+            # Only rewrite when at least one entry was successfully removed,
+            # and always retain the metadata of failed entries.
+            if removed_inputs:
+                original_mapping = dict(cls.fpath_cname)
+                new_mapping = {
+                    input_path: cache_name
+                    for input_path, cache_name in original_mapping.items()
+                    if input_path not in removed_inputs
+                }
+                try:
+                    cls._dump_cache_info_atomic(new_mapping)
+                except OSError as exc:
+                    report_entries.append(
+                        {
+                            "input_path": "",
+                            "cache_name": "",
+                            "cache_path": cls.get_cache_info_path(),
+                            "cache_exists": None,
+                            "input_exists": None,
+                            "cache_size": None,
+                            "cache_mtime": None,
+                            "cache_mtime_epoch": None,
+                            "is_outdated": None,
+                            "is_orphaned": None,
+                            "is_symlink": None,
+                            "is_regular_file": None,
+                            "status": None,
+                            "action": "failed",
+                            "reason": f"failed to atomically update cache info: {exc}",
+                        }
+                    )
+                else:
+                    cls.fpath_cname = new_mapping
+                    cls.info_changed = False
+                    metadata_updated = True
+
+        summary = {
+            "selected": len(report_entries),
+            "would_delete": sum(entry["action"] == "would_delete" for entry in report_entries),
+            "deleted": sum(entry["action"] == "deleted" for entry in report_entries),
+            "failed": sum(entry["action"] == "failed" for entry in report_entries),
+        }
+        return {
+            "apply": apply,
+            "statuses": list(normalized_statuses),
+            "cache_dir": cls.get_cache_dir(),
+            "cache_info": cls.get_cache_info_path(),
+            "metadata_updated": metadata_updated,
+            "summary": summary,
+            "entries": report_entries,
+        }
+
+    @classmethod
+    def _dump_cache_info_atomic(cls, data: dict[str, str]) -> None:
+        """Write cache_info atomically via a temp file and os.replace()."""
+        info_path = Path(CACHE_INFO_PATH)
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=info_path.parent, prefix=f".{info_path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, info_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
     @classmethod
     def _stem2name(cls, stem: str) -> str:
@@ -394,6 +643,6 @@ class Ns_Cache:
     def save_cache_info(cls) -> None:
         if cls.info_changed:
             logging.debug(f"Saving cache information to {CACHE_INFO_PATH}...")
-            Ns_IO.dump_json(cls.fpath_cname, CACHE_INFO_PATH)
+            cls._dump_cache_info_atomic(cls.fpath_cname)
         else:
             logging.debug("No new cache information to save.")

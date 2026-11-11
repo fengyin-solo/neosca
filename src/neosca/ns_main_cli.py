@@ -1,9 +1,12 @@
 import argparse
+import json
 import logging
 import os
 import os.path as os_path
 import sys
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 from neosca.ns_about import __title__, __version__
 from neosca.ns_consts import CACHE_DIR
@@ -49,6 +52,7 @@ class Ns_Main_Cli:
         self.sca_parser = self.create_sca_parser(subparsers)
         self.lca_parser = self.create_lca_parser(subparsers)
         self.gui_parser = self.create_gui_parser(subparsers)
+        self.cache_parser = self.create_cache_parser(subparsers)
         return parser
 
     def create_sca_parser(self, subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
@@ -270,6 +274,80 @@ class Ns_Main_Cli:
         gui_parser.set_defaults(is_gui=True)
         return gui_parser
 
+    def create_cache_parser(self, subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+        cache_parser = subparsers.add_parser("cache", help="inspect and prune cached analysis files")
+        self.__add_log_levels(cache_parser)
+        cache_parser.set_defaults(is_cache_cmd=True)
+        cache_subparsers: argparse._SubParsersAction = cache_parser.add_subparsers(
+            title="cache commands", dest="cache_command"
+        )
+
+        list_parser = cache_subparsers.add_parser(
+            "list", help="list cache entries with validity, outdated, missing and orphan status"
+        )
+        list_parser.add_argument(
+            "--format",
+            dest="oformat",
+            choices=("text", "json"),
+            default="text",
+            help='Output format. The default is "text".',
+        )
+        list_parser.add_argument(
+            "--output-file",
+            "-o",
+            metavar="<filename>",
+            dest="ofile",
+            default=None,
+            help="Write the report to the given file instead of the stdout.",
+        )
+        self.__add_log_levels(list_parser)
+        list_parser.set_defaults(is_cache_cmd=True, func=self.parse_cache_args)
+
+        prune_parser = cache_subparsers.add_parser(
+            "prune",
+            help="prune missing, outdated or orphaned cache entries (dry run unless --apply is given)",
+        )
+        prune_parser.add_argument(
+            "--status",
+            dest="statuses",
+            metavar="<status>",
+            nargs="+",
+            choices=Ns_Cache.PRUNABLE_STATUSES,
+            default=None,
+            help=(
+                "Entry status(es) to prune. Choose any combination of"
+                ' "missing", "outdated" and "orphaned". The default is all three.'
+            ),
+        )
+        prune_parser.add_argument(
+            "--apply",
+            dest="is_apply",
+            action="store_true",
+            default=False,
+            help=(
+                "Actually delete the selected cache entries and update cache info."
+                " Without this flag, only a dry-run preview is performed."
+            ),
+        )
+        prune_parser.add_argument(
+            "--format",
+            dest="oformat",
+            choices=("text", "json"),
+            default="text",
+            help='Output format. The default is "text".',
+        )
+        prune_parser.add_argument(
+            "--output-file",
+            "-o",
+            metavar="<filename>",
+            dest="ofile",
+            default=None,
+            help="Write the report to the given file instead of the stdout.",
+        )
+        self.__add_log_levels(prune_parser)
+        prune_parser.set_defaults(is_cache_cmd=True, func=self.parse_cache_args)
+        return cache_parser
+
     def parse_sca_args(self, options: argparse.Namespace) -> Ns_Procedure_Result:
         if options.is_skip_parsing:
             options.is_cache = False
@@ -374,6 +452,15 @@ class Ns_Main_Cli:
         }
         return True, None
 
+    def parse_cache_args(self, options: argparse.Namespace) -> Ns_Procedure_Result:
+        if getattr(options, "cache_command", None) == "prune":
+            if options.statuses is None:
+                options.statuses = list(Ns_Cache.PRUNABLE_STATUSES)
+            else:
+                # Drop duplicates while retaining order.
+                options.statuses = list(dict.fromkeys(options.statuses))
+        return True, None
+
     def parse_args(self, argv: list[str]) -> Ns_Procedure_Result:
         idx: int | None = None
         if "--" in argv[1:]:
@@ -383,9 +470,9 @@ class Ns_Main_Cli:
         else:
             options, ifile_list = self.args_parser.parse_known_args(argv[1:])
 
-        assert not (
-            options.is_quiet and options.is_verbose
-        ), "logging cannot be quiet and verbose at the same time"
+        assert not (options.is_quiet and options.is_verbose), (
+            "logging cannot be quiet and verbose at the same time"
+        )
         if options.is_quiet:
             logging.basicConfig(format="%(message)s", level=logging.CRITICAL)
         elif options.is_verbose:
@@ -479,11 +566,150 @@ class Ns_Main_Cli:
         main_gui()
         return True, None
 
+    # ------------------------------------------------------------------
+    # cache list / prune
+    # ------------------------------------------------------------------
+    def build_cache_list_payload(self) -> dict[str, Any]:
+        entries = Ns_Cache.list_entries()
+        return {
+            "cache_dir": Ns_Cache.get_cache_dir(),
+            "cache_info": Ns_Cache.get_cache_info_path(),
+            "count": len(entries),
+            "entries": entries,
+        }
+
+    def run_cache(self) -> Ns_Procedure_Result:
+        options = self.options
+        if getattr(options, "cache_command", None) is None:
+            self.cache_parser.print_help()
+            return True, None
+
+        if options.cache_command == "list":
+            payload = self.build_cache_list_payload()
+            rendered = self.render_cache_payload(payload, options.oformat, is_prune=False)
+        else:
+            payload = Ns_Cache.prune_entries(options.statuses, apply=options.is_apply)
+            rendered = self.render_cache_payload(payload, options.oformat, is_prune=True)
+        self.write_cache_output(rendered, options.ofile)
+
+        if options.cache_command == "prune" and payload["summary"]["failed"]:
+            return (
+                False,
+                "Cache prune finished with errors. See the report for the failed entries.",
+            )
+        return True, None
+
+    @staticmethod
+    def _fit_column(text: str, width: int) -> str:
+        if len(text) <= width:
+            return text
+        return "…" + text[-(width - 1) :]
+
+    @staticmethod
+    def _yes_or_no(value: bool) -> str:
+        return "yes" if value else "no"
+
+    def _render_cache_list_text(self, payload: dict[str, Any]) -> str:
+        lines = [f"Cache root: {payload['cache_dir']}", f"Cache info: {payload['cache_info']}"]
+        entries = payload["entries"]
+        if not entries:
+            lines.append("No cache entries found.")
+            return "\n".join(lines)
+
+        columns: list[tuple[str, Any, int]] = [
+            ("INPUT PATH", lambda entry: entry["input_path"], 48),
+            ("CACHE PATH", lambda entry: entry["cache_path"], 48),
+            (
+                "SIZE (BYTES)",
+                lambda entry: "-" if entry["cache_size"] is None else str(entry["cache_size"]),
+                14,
+            ),
+            (
+                "MODIFIED (UTC)",
+                lambda entry: entry["cache_mtime"] if entry["cache_mtime"] is not None else "-",
+                27,
+            ),
+            ("CACHE EXISTS", lambda entry: self._yes_or_no(entry["cache_exists"]), 12),
+            ("INPUT EXISTS", lambda entry: self._yes_or_no(entry["input_exists"]), 12),
+            ("OUTDATED", lambda entry: self._yes_or_no(entry["is_outdated"]), 9),
+            ("ORPHANED", lambda entry: self._yes_or_no(entry["is_orphaned"]), 9),
+            ("STATUS", lambda entry: entry["status"], 10),
+        ]
+        fitted_rows = [
+            [self._fit_column(str(selector(entry)), max_width) for _, selector, max_width in columns]
+            for entry in entries
+        ]
+        widths = [
+            max(len(header), *(len(row[col_idx]) for row in fitted_rows))
+            for col_idx, (header, _, _) in enumerate(columns)
+        ]
+        lines.append("  ".join(header.ljust(widths[col_idx]) for col_idx, (header, _, _) in enumerate(columns)))
+        for row in fitted_rows:
+            lines.append("  ".join(cell.ljust(widths[col_idx]) for col_idx, cell in enumerate(row)))
+
+        counts = {
+            status: sum(entry["status"] == status for entry in entries) for status in Ns_Cache.ALL_STATUSES
+        }
+        lines.append(
+            f"{len(entries)} entries: {counts[Ns_Cache.STATUS_VALID]} valid, "
+            f"{counts[Ns_Cache.STATUS_MISSING]} missing, {counts[Ns_Cache.STATUS_OUTDATED]} outdated, "
+            f"{counts[Ns_Cache.STATUS_ORPHANED]} orphaned."
+        )
+        return "\n".join(lines)
+
+    def _render_cache_prune_text(self, payload: dict[str, Any]) -> str:
+        lines = [
+            f"Cache root: {payload['cache_dir']}",
+            f"Cache info: {payload['cache_info']}",
+            f"Selected statuses: {', '.join(payload['statuses'])}",
+        ]
+        if payload["apply"]:
+            lines.append("Mode: apply (selected cache files are deleted)")
+        else:
+            lines.append("Mode: dry run (no changes; pass --apply to actually delete)")
+
+        entries = payload["entries"]
+        if not entries:
+            lines.append("No cache entries matched the selected statuses.")
+        for entry in entries:
+            action = entry["action"]
+            line = f"[{action:<12}] {str(entry['status']):<8} {entry['input_path']} -> {entry['cache_path']}"
+            if entry.get("reason"):
+                line += f"  ({entry['reason']})"
+            lines.append(line)
+
+        summary = payload["summary"]
+        lines.append(
+            f"Summary: {summary['selected']} selected, {summary['would_delete']} would delete, "
+            f"{summary['deleted']} deleted, {summary['failed']} failed."
+        )
+        lines.append(f"Cache info updated: {'yes' if payload['metadata_updated'] else 'no'}")
+        return "\n".join(lines)
+
+    def render_cache_payload(self, payload: dict[str, Any], oformat: str, *, is_prune: bool) -> str:
+        if oformat == "json":
+            return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        if is_prune:
+            return self._render_cache_prune_text(payload)
+        return self._render_cache_list_text(payload)
+
+    @staticmethod
+    def write_cache_output(content: str, ofile: str | None) -> None:
+        if ofile is None:
+            sys.stdout.write(content + "\n")
+            return
+        out_path = Path(ofile)
+        if out_path.parent != Path(""):
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(content + "\n", encoding="utf-8")
+
     def run(self) -> Ns_Procedure_Result:
         if self.options.version:
             return self.show_version()
         elif getattr(self.options, "is_gui", False):
             return self.run_gui()
+        elif getattr(self.options, "is_cache_cmd", False):
+            return self.run_cache()
         elif getattr(self.options, "list_fields", False):
             return self.options.analyzer_class.list_fields()
         elif (
